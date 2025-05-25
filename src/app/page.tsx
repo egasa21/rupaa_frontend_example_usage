@@ -1,103 +1,184 @@
-import Image from "next/image";
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+
+type DetectedPerson = {
+  name: string;
+  match: boolean;
+};
+
+type FaceBox = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
 
 export default function Home() {
-  return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm/6 text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-[family-name:var(--font-geist-mono)] font-semibold">
-              src/app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [detectedPeople, setDetectedPeople] = useState<DetectedPerson[]>([]);
+  const [faceBoxes, setFaceBoxes] = useState<FaceBox[]>([]);
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+  useEffect(() => {
+    let intervalId: NodeJS.Timeout;
+
+    async function startCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+        }
+
+        intervalId = setInterval(captureAndCheckFace, 5000);
+      } catch (err) {
+        console.error("Camera access denied or not available.", err);
+      }
+    }
+
+    startCamera();
+
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, []);
+
+  async function captureAndCheckFace() {
+    if (!videoRef.current || !canvasRef.current) return;
+
+    const video = videoRef.current;
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    const context = canvas.getContext("2d");
+    if (!context) return;
+
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const blob = await new Promise<Blob>((resolve) =>
+      canvas.toBlob((blob) => blob && resolve(blob), "image/jpeg")
+    );
+
+    if (!blob) return;
+
+    const formData = new FormData();
+    formData.append("file", blob, "frame.jpg");
+
+    try {
+      const response = await fetch("http://localhost:8080/v1/face-embeddings/match", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! Status: ${response.status}`);
+      }
+
+      const result = await response.json();
+      console.log("Match result:", result);
+
+      if (result.boxes && Array.isArray(result.boxes)) {
+        setFaceBoxes(result.boxes);
+        drawBoxes(result.boxes);
+      }
+
+      if (result.match && result.results?.length) {
+        const firstMatch = result.results[0];
+        const name = firstMatch.name || "Unknown";
+        const isBlacklisted = firstMatch.is_blacklisted || false;
+
+        setDetectedPeople((prev) => {
+          const alreadyExists = prev.some((p) => p.name === name);
+          if (alreadyExists) return prev;
+
+          return [
+            ...prev,
+            {
+              name,
+              match: isBlacklisted,
+            },
+          ];
+        });
+      }
+    } catch (error) {
+      console.error("Error during face match:", error);
+    }
+  }
+
+
+  function drawBoxes(boxes: FaceBox[]) {
+    const canvas = canvasRef.current;
+    const video = videoRef.current;
+    if (!canvas || !video) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    boxes.forEach((box) => {
+      ctx.beginPath();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(255, 0, 0, 0.8)";
+      ctx.rect(box.x, box.y, box.width, box.height);
+      ctx.stroke();
+    });
+  }
+
+  return (
+    <div className="flex h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 text-white">
+      {/* Camera View */}
+      <div className="flex-1 flex items-center justify-center p-6">
+        <div className="relative w-full max-w-4xl aspect-video rounded-2xl overflow-hidden shadow-2xl border border-gray-700 bg-gray-800/20 backdrop-blur-md">
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            className="absolute inset-0 w-full h-full object-cover"
+          />
+          <canvas
+            ref={canvasRef}
+            className="absolute inset-0 w-full h-full pointer-events-none"
+          />
+          <div className="absolute bottom-0 left-0 right-0 bg-black/40 p-4 text-sm text-gray-300">
+            Live Camera Feed
+          </div>
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
+      </div>
+
+      {/* Sidebar */}
+      <aside className="w-96 bg-gray-800/30 backdrop-blur-lg border-l border-gray-700 p-6 flex flex-col">
+        <h2 className="text-2xl font-bold mb-6 tracking-wide">Rupaa Syndicate Detection</h2>
+
+        {detectedPeople.length === 0 ? (
+          <div className="text-gray-400 text-center mt-12">No faces detected yet</div>
+        ) : (
+          <ul className="space-y-4 overflow-y-auto flex-1">
+            {detectedPeople.map((person, idx) => (
+              <li
+                key={idx}
+                className={`p-4 rounded-xl shadow transition duration-300 ${person.match
+                  ? "bg-red-600/30 border border-red-400 text-red-200"
+                  : "bg-green-600/20 border border-green-400 text-green-200"
+                  }`}
+              >
+                <p className="font-semibold text-lg">{person.name}</p>
+                <p className="text-sm">
+                  {person.match ? "⚠️ Blacklisted" : "✅ Clear"}
+                </p>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <footer className="text-xs text-gray-500 mt-8 text-center">
+          Powered by Rentalize
+        </footer>
+      </aside>
     </div>
   );
 }
