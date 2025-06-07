@@ -1,10 +1,12 @@
 "use client";
 
+import DialogAIFaceRecog from "@/components/DialogAIFaceRecog";
 import { useEffect, useRef, useState } from "react";
 
 type DetectedPerson = {
   name: string;
   match: boolean;
+  description?: string | null;
 };
 
 type FaceBox = {
@@ -14,14 +16,28 @@ type FaceBox = {
   height: number;
 };
 
-export default function Home() {
+type MatchedFace = {
+  id: number;
+  name: string;
+  suspected: boolean;
+  description?: string | null;
+  image_url: string;
+  user_id: string;
+  box: FaceBox;
+};
+
+const HARDCODED_TOKEN = "";
+
+export default function FaceRecognition() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const wsRef = useRef<WebSocket | null>(null);
   const [detectedPeople, setDetectedPeople] = useState<DetectedPerson[]>([]);
   const [faceBoxes, setFaceBoxes] = useState<FaceBox[]>([]);
+  const [visible, setVisible] = useState(true);
 
   useEffect(() => {
-    let intervalId: NodeJS.Timeout;
+    let intervalId: NodeJS.Timeout | null = null;
 
     async function startCamera() {
       try {
@@ -29,85 +45,101 @@ export default function Home() {
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
         }
-
-        intervalId = setInterval(captureAndCheckFace, 5000);
       } catch (err) {
         console.error("Camera access denied or not available.", err);
       }
     }
 
-    startCamera();
+    function connectWebSocket() {
+      if (!HARDCODED_TOKEN) {
+        console.error("No auth token provided");
+        return;
+      }
+
+      wsRef.current = new WebSocket("ws://localhost:8080/match-face");
+
+      wsRef.current.onopen = () => {
+        console.log("WebSocket connected");
+        wsRef.current?.send(JSON.stringify({ token: HARDCODED_TOKEN }));
+        intervalId = setInterval(sendFrame, 5000);
+      };
+
+      wsRef.current.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+
+          if (data.error) {
+            console.error("Server error:", data.error);
+            setFaceBoxes([]);
+            setDetectedPeople([]);
+            return;
+          }
+
+          if (data.match && Array.isArray(data.matched_faces)) {
+            const matches: MatchedFace[] = data.matched_faces;
+
+            setFaceBoxes(matches.map((f) => f.box));
+
+            setDetectedPeople(
+              matches.map((f) => ({
+                name: `Nama: ${f.name}`,
+                match: f.suspected,
+                description: f.description || null,
+              }))
+            );
+          } else {
+            setFaceBoxes([]);
+            setDetectedPeople([]);
+          }
+        } catch (e) {
+          console.error("Error parsing WS message", e);
+        }
+      };
+
+      wsRef.current.onerror = (e) => {
+        console.error("WebSocket error", e);
+      };
+
+      wsRef.current.onclose = () => {
+        console.log("WebSocket disconnected");
+        if (intervalId) clearInterval(intervalId);
+      };
+    }
+
+    async function sendFrame() {
+      if (!videoRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+
+      const video = videoRef.current;
+      const canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      const base64 = canvas.toDataURL("image/jpeg").split(",")[1];
+      wsRef.current.send(JSON.stringify({ image: base64 }));
+    }
+
+    if (visible) {
+      startCamera();
+      connectWebSocket();
+    }
 
     return () => {
       if (intervalId) clearInterval(intervalId);
+      if (wsRef.current) wsRef.current.close();
+      if (videoRef.current?.srcObject) {
+        (videoRef.current.srcObject as MediaStream)
+          .getTracks()
+          .forEach((track) => track.stop());
+      }
     };
-  }, []);
+  }, [visible]);
 
-  async function captureAndCheckFace() {
-    if (!videoRef.current || !canvasRef.current) return;
-
-    const video = videoRef.current;
-    const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-
-    const context = canvas.getContext("2d");
-    if (!context) return;
-
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    const blob = await new Promise<Blob>((resolve) =>
-      canvas.toBlob((blob) => blob && resolve(blob), "image/jpeg")
-    );
-
-    if (!blob) return;
-
-    const formData = new FormData();
-    formData.append("file", blob, "frame.jpg");
-
-    try {
-      const response = await fetch("http://localhost:8080/v1/face-embeddings/match", {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! Status: ${response.status}`);
-      }
-
-      const result = await response.json();
-      console.log("Match result:", result);
-
-      if (result.boxes && Array.isArray(result.boxes)) {
-        setFaceBoxes(result.boxes);
-        drawBoxes(result.boxes);
-      }
-
-      if (result.match && result.results?.length) {
-        const firstMatch = result.results[0];
-        const name = firstMatch.name || "Unknown";
-        const isBlacklisted = firstMatch.is_blacklisted || false;
-
-        setDetectedPeople((prev) => {
-          const alreadyExists = prev.some((p) => p.name === name);
-          if (alreadyExists) return prev;
-
-          return [
-            ...prev,
-            {
-              name,
-              match: isBlacklisted,
-            },
-          ];
-        });
-      }
-    } catch (error) {
-      console.error("Error during face match:", error);
-    }
-  }
-
-
-  function drawBoxes(boxes: FaceBox[]) {
+  useEffect(() => {
     const canvas = canvasRef.current;
     const video = videoRef.current;
     if (!canvas || !video) return;
@@ -117,68 +149,63 @@ export default function Home() {
 
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
+
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    boxes.forEach((box) => {
+    faceBoxes.forEach((box) => {
       ctx.beginPath();
       ctx.lineWidth = 3;
       ctx.strokeStyle = "rgba(255, 0, 0, 0.8)";
       ctx.rect(box.x, box.y, box.width, box.height);
       ctx.stroke();
     });
-  }
+  }, [faceBoxes]);
 
   return (
-    <div className="flex h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 text-white">
-      {/* Camera View */}
-      <div className="flex-1 flex items-center justify-center p-6">
-        <div className="relative w-full max-w-4xl aspect-video rounded-2xl overflow-hidden shadow-2xl border border-gray-700 bg-gray-800/20 backdrop-blur-md">
+    <DialogAIFaceRecog
+      title="Face Recognition"
+      visible={visible}
+      onClose={() => setVisible(false)}
+    >
+      <div className="flex flex-col items-center space-y-3">
+        <div className="relative w-[400px] h-[240px]">
           <video
             ref={videoRef}
             autoPlay
             playsInline
             muted
-            className="absolute inset-0 w-full h-full object-cover"
+            className="absolute inset-0 w-full h-full object-cover rounded-md border"
           />
           <canvas
             ref={canvasRef}
-            className="absolute inset-0 w-full h-full pointer-events-none"
+            className="absolute inset-0 w-full h-full pointer-events-none rounded-md border"
           />
-          <div className="absolute bottom-0 left-0 right-0 bg-black/40 p-4 text-sm text-gray-300">
-            Live Camera Feed
-          </div>
         </div>
-      </div>
 
-      {/* Sidebar */}
-      <aside className="w-96 bg-gray-800/30 backdrop-blur-lg border-l border-gray-700 p-6 flex flex-col">
-        <h2 className="text-2xl font-bold mb-6 tracking-wide">Rupaa Syndicate Detection</h2>
-
-        {detectedPeople.length === 0 ? (
-          <div className="text-gray-400 text-center mt-12">No faces detected yet</div>
-        ) : (
-          <ul className="space-y-4 overflow-y-auto flex-1">
-            {detectedPeople.map((person, idx) => (
+        {detectedPeople.length > 0 && (
+          <ul className="w-full space-y-2 text-sm mt-2">
+            {detectedPeople.map((person, i) => (
               <li
-                key={idx}
-                className={`p-4 rounded-xl shadow transition duration-300 ${person.match
-                  ? "bg-red-600/30 border border-red-400 text-red-200"
-                  : "bg-green-600/20 border border-green-400 text-green-200"
+                key={i}
+                className={`p-2 rounded border ${person.match
+                  ? "bg-red-100 text-red-800 border-red-400"
+                  : "bg-green-100 text-green-800 border-green-400"
                   }`}
               >
-                <p className="font-semibold text-lg">{person.name}</p>
-                <p className="text-sm">
-                  {person.match ? "⚠️ Blacklisted" : "✅ Clear"}
-                </p>
+                <div className="font-semibold">{person.name}</div>
+                <div>
+                  {person.match ? "⚠️ Suspected Person" : "✅ Clear"}
+                  {person.description && (
+                    <p className="text-xs text-gray-600 mt-1 italic">
+                      {person.description}
+                    </p>
+                  )}
+                </div>
               </li>
             ))}
           </ul>
         )}
-
-        <footer className="text-xs text-gray-500 mt-8 text-center">
-          Powered by Rentalize
-        </footer>
-      </aside>
-    </div>
+      </div>
+    </DialogAIFaceRecog>
   );
 }
